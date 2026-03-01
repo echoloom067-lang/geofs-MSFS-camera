@@ -3,7 +3,7 @@
 // @namespace    https://greasyfork.org/
 // @version      7.0.0
 // @description  MSFS spring camera + ground rumble + touchdown thump + TRUE buttery smooth zoom
-// @author       Claude
+// @author       Echoloom
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
