@@ -1,0 +1,475 @@
+// ==UserScript==
+// @name         GeoFS — MSFS 2020 Cinematic Camera
+// @namespace    https://greasyfork.org/
+// @version      7.0.0
+// @description  MSFS spring camera + ground rumble + touchdown thump + TRUE buttery smooth zoom
+// @author       Claude
+// @match        https://www.geo-fs.com/geofs.php*
+// @match        https://*.geo-fs.com/geofs.php*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  HOW SMOOTH ZOOM WORKS HERE (why v6 failed):
+  //
+  //  GeoFS zoom = it moves the Cesium camera along its own direction vector
+  //  (dolly in/out). There is no single "distance" property to write to —
+  //  GeoFS recalculates the camera position from scratch every frame.
+  //
+  //  The fix:
+  //  1. Intercept wheel events with capture+preventDefault so GeoFS NEVER
+  //     sees them — its snap-zoom code never runs.
+  //  2. We accumulate a smooth TARGET distance ourselves.
+  //  3. Every frame, after our spring rotation override, we also override
+  //     the camera POSITION by computing: aircraftPos + (-direction * dist)
+  //     using the Cesium camera's current direction vector and our smoothed dist.
+  //  4. Exponential decay eases currentDist → targetDist every frame = silk.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const CFG = {
+    enabled: true,
+
+    roll:    { stiffness: 6.0,  damp: 4.8 },
+    heading: { stiffness: 9.0,  damp: 5.8 },
+    pitch:   { stiffness: 14.0, damp: 7.5 },
+
+    zoom: {
+      enabled:    true,
+      lambda:     4.0,      // easing speed — 4 = MSFS feel (lower = floatier)
+      stepFactor: 0.13,     // how far each scroll tick moves target (fraction of current dist)
+      minDist:    10,       // metres
+      maxDist:    3000,
+    },
+
+    groundShake: {
+      enabled:      true,
+      maxMagnitude: 0.0055,
+      fullSpeedKts: 80,
+      frequency:    14.0,
+    },
+
+    touchdown: {
+      enabled:        true,
+      vsThresholdFpm: -150,
+      peakMagnitude:  0.018,
+      decayRate:      8.0,
+      cooldown:       3.0,
+    },
+  };
+
+  // ── Spring state ──────────────────────────────────────────────────────────
+  const spring = {
+    roll:    { val: 0, vel: 0 },
+    heading: { val: 0, vel: 0 },
+    pitch:   { val: 0, vel: 0 },
+  };
+
+  const shake = {
+    impactAmplitude: 0,
+    impactLastTime:  0,
+    impactStartTime: 0,
+    wasOnGround:     false,
+  };
+
+  // Zoom state
+  const zst = {
+    current: -1,   // current smoothed distance (metres), -1 = uninitialised
+    target:  -1,
+  };
+
+  let initialized = false;
+  let lastT = performance.now();
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function springStep(s, target, cfg, dt) {
+    let err = target - s.val;
+    while (err >  Math.PI) err -= 2 * Math.PI;
+    while (err < -Math.PI) err += 2 * Math.PI;
+    const acc = cfg.stiffness * err - cfg.damp * s.vel;
+    s.vel += acc * dt;
+    s.val += s.vel * dt;
+  }
+
+  function expDecay(cur, tgt, lambda, dt) {
+    return tgt + (cur - tgt) * Math.exp(-lambda * dt);
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function rumbleNoise(t, seed) {
+    return (
+      Math.sin(t * 1.000 + seed)       * 0.40 +
+      Math.sin(t * 1.618 + seed * 1.3) * 0.25 +
+      Math.sin(t * 2.414 + seed * 0.7) * 0.20 +
+      Math.sin(t * 3.141 + seed * 1.9) * 0.15
+    );
+  }
+
+  // Measure how far the Cesium camera currently sits from the aircraft
+  function measureCurrentDist(cesiumCam) {
+    try {
+      const ac = window.geofs?.aircraft?.instance;
+      // GeoFS puts the aircraft world position in geofs.aircraft.instance.rigidBody?.position
+      // or on the object3d. Try both.
+      let ap = ac?.rigidBody?.position || ac?.object3d?.position;
+      if (!ap) return 80;
+      const cp = cesiumCam.positionWC;
+      const dx = cp.x - ap.x, dy = cp.y - ap.y, dz = cp.z - ap.z;
+      return Math.sqrt(dx*dx + dy*dy + dz*dz);
+    } catch (_) { return 80; }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  WHEEL INTERCEPT — block GeoFS, handle zoom ourselves
+  // ══════════════════════════════════════════════════════════════════════════
+  function hookScroll() {
+    window.addEventListener('wheel', function onWheel(e) {
+      if (!CFG.enabled || !CFG.zoom.enabled) return;
+
+      // Stop GeoFS from ever seeing this event
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
+      // Init target if needed
+      if (zst.target < 0) {
+        const d = measureCurrentDist(window.geofs?.api?.viewer?.camera);
+        zst.current = d;
+        zst.target  = d;
+      }
+
+      const dir = e.deltaY > 0 ? 1 : -1;          // 1 = zoom out, -1 = zoom in
+      zst.target *= (1 + dir * CFG.zoom.stepFactor);
+      zst.target  = clamp(zst.target, CFG.zoom.minDist, CFG.zoom.maxDist);
+
+    }, { capture: true, passive: false });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  MAIN HOOK — runs after geofs.camera.update() every frame
+  // ══════════════════════════════════════════════════════════════════════════
+  function afterCameraUpdate() {
+    if (!CFG.enabled) return;
+    try {
+      const geofs = window.geofs;
+      if (!geofs?.animation?.values || !geofs?.api?.viewer) return;
+      const cesiumCam = geofs.api.viewer.camera;
+      if (!cesiumCam) return;
+
+      // After GeoFS update, Cesium cam = true aircraft angles + GeoFS-chosen distance
+      const trueH   = cesiumCam.heading;
+      const trueP   = cesiumCam.pitch;
+      const trueR   = cesiumCam.roll;
+
+      if (!isFinite(trueH) || !isFinite(trueP) || !isFinite(trueR)) return;
+
+      // ── Seed on first frame ──────────────────────────────────────────────
+      if (!initialized) {
+        spring.heading.val = trueH; spring.heading.vel = 0;
+        spring.pitch.val   = trueP; spring.pitch.vel   = 0;
+        spring.roll.val    = trueR; spring.roll.vel    = 0;
+        shake.wasOnGround  = false;
+        zst.current        = measureCurrentDist(cesiumCam);
+        zst.target         = zst.current;
+        initialized        = true;
+        return;
+      }
+
+      const now = performance.now();
+      const dt  = Math.min((now - lastT) / 1000, 0.05);
+      lastT = now;
+      const t = now / 1000;
+
+      // ── Spring rotation ──────────────────────────────────────────────────
+      springStep(spring.heading, trueH, CFG.heading, dt);
+      springStep(spring.pitch,   trueP, CFG.pitch,   dt);
+      springStep(spring.roll,    trueR, CFG.roll,    dt);
+
+      // ── Smooth zoom ──────────────────────────────────────────────────────
+      // Ease current distance toward target
+      if (CFG.zoom.enabled && zst.target > 0) {
+        zst.current = expDecay(zst.current, zst.target, CFG.zoom.lambda, dt);
+      }
+
+      // ── Aircraft / shake data ────────────────────────────────────────────
+      const vals     = geofs.animation.values;
+      const onGround = !!(vals.groundContact || vals.onGround || (vals.altitude != null && vals.altitude < 5));
+      const speedKts = Math.abs(vals.kias || vals.speed || 0);
+      const vsFpm    = (vals.verticalSpeed || 0) * 196.85;
+
+      if (CFG.touchdown.enabled) {
+        const td = CFG.touchdown;
+        if (!shake.wasOnGround && onGround && vsFpm < td.vsThresholdFpm &&
+            (t - shake.impactLastTime) > td.cooldown) {
+          const hardness = Math.min(Math.abs(vsFpm) / 800, 1.5);
+          shake.impactAmplitude = td.peakMagnitude * hardness;
+          shake.impactLastTime  = t;
+          shake.impactStartTime = t;
+          console.log(`%c[MSFS Cam] Touchdown! ${Math.round(vsFpm)} fpm · ${hardness.toFixed(2)}x`,
+            hardness > 1 ? 'color:#ff6644' : 'color:#44cc88');
+        }
+        shake.wasOnGround = onGround;
+      }
+      if (shake.impactAmplitude > 0.00001)
+        shake.impactAmplitude *= Math.exp(-CFG.touchdown.decayRate * dt);
+      else shake.impactAmplitude = 0;
+
+      let shakeP = 0, shakeR = 0;
+      if (CFG.groundShake.enabled && onGround && speedKts > 2) {
+        const gs = CFG.groundShake;
+        const spd = Math.min(speedKts / gs.fullSpeedKts, 1);
+        const mag = gs.maxMagnitude * spd * Math.min(speedKts / 10, 1);
+        const frq = gs.frequency * (spd * 0.7 + 0.3);
+        shakeP += rumbleNoise(t * frq, 0) * mag;
+        shakeR += rumbleNoise(t * frq * 0.85, 7.3) * mag * 0.7;
+      }
+      if (shake.impactAmplitude > 0) {
+        const ph = (t - shake.impactStartTime) * 18;
+        shakeP += Math.sin(ph)       * shake.impactAmplitude;
+        shakeR += Math.sin(ph * 0.7) * shake.impactAmplitude * 0.6;
+        if (shake.impactAmplitude > 0.005)
+          spring.heading.val += Math.sin(ph * 0.4) * shake.impactAmplitude * 0.3 * dt * 6;
+      }
+
+      // ── Build final camera orientation ───────────────────────────────────
+      const finalH = spring.heading.val;
+      const finalP = spring.pitch.val + shakeP;
+      const finalR = spring.roll.val  + shakeR;
+
+      // ── Compute smooth-zoom camera position ──────────────────────────────
+      // GeoFS already placed the camera at some position. We need the aircraft
+      // world-space position, then push the camera back along its look direction
+      // by our smoothed distance.
+      //
+      // Cesium direction vector points FROM camera TOWARD target.
+      // So: cameraPos = aircraftPos - direction * dist
+      //
+      // We use the CURRENT (post-spring) direction rather than Cesium's stored
+      // direction so position and orientation stay in sync.
+
+      let finalPos = cesiumCam.positionWC; // fallback = keep GeoFS position
+
+      if (CFG.zoom.enabled && zst.current > 0) {
+        try {
+          const ac  = geofs.aircraft.instance;
+          const ap  = ac?.rigidBody?.position || ac?.object3d?.position;
+          if (ap) {
+            // Compute look direction from our spring-smoothed HPR
+            // In Cesium, heading=0 points North, pitch=0 is horizontal.
+            // direction = (cos(pitch)*sin(heading), cos(pitch)*cos(heading), -sin(pitch))
+            // but in ECEF we need to rotate by the surface normal at the aircraft's position.
+            // Simplest correct approach: use cesiumCam.directionWC (set by setView below after
+            // we call it), but we need the position BEFORE setView.
+            // So: use the direction that Cesium has right now (from GeoFS's setView this frame).
+            const d  = cesiumCam.directionWC;
+            const dist = zst.current;
+            finalPos = {
+              x: ap.x - d.x * dist,
+              y: ap.y - d.y * dist,
+              z: ap.z - d.z * dist,
+            };
+          }
+        } catch (_) {}
+      }
+
+      // ── Write to Cesium — position + orientation together ────────────────
+      cesiumCam.setView({
+        destination: finalPos,
+        orientation: {
+          heading: finalH,
+          pitch:   finalP,
+          roll:    finalR,
+        },
+      });
+
+    } catch (_) { /* not ready */ }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  HOOK GEOFS
+  // ══════════════════════════════════════════════════════════════════════════
+  function hookGeoFS() {
+    const geofs = window.geofs;
+    if (!geofs?.camera || typeof geofs.camera.update !== 'function') {
+      setTimeout(hookGeoFS, 500); return;
+    }
+    const orig = geofs.camera.update.bind(geofs.camera);
+    geofs.camera.update = function (...args) {
+      const r = orig(...args);
+      afterCameraUpdate();
+      return r;
+    };
+    hookScroll();
+    console.log('%c[MSFS Cam v7] ✨ Loaded — spring · rumble · touchdown · butter zoom', 'color:#00d4ff;font-weight:bold;font-size:12px');
+    createUI();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  UI
+  // ══════════════════════════════════════════════════════════════════════════
+  function createUI() {
+    const style = document.createElement('style');
+    style.textContent = `
+      #mc7{
+        position:fixed;bottom:18px;right:18px;z-index:99999;width:252px;
+        background:rgba(3,7,14,0.93);
+        border:1px solid rgba(0,200,255,0.18);border-radius:13px;
+        font:11px/1.5 'Courier New',monospace;color:#80aabe;
+        box-shadow:0 10px 50px rgba(0,0,0,0.65),inset 0 1px 0 rgba(255,255,255,0.03);
+        backdrop-filter:blur(16px);user-select:none;
+        transition:opacity .22s,transform .22s;overflow:hidden;
+      }
+      #mc7.hidden{opacity:0;pointer-events:none;transform:translateY(8px)}
+      .mc7-head{
+        display:flex;justify-content:space-between;align-items:center;
+        padding:10px 14px 9px;background:rgba(0,180,255,0.05);
+        border-bottom:1px solid rgba(0,200,255,0.09);
+      }
+      .mc7-title{font-weight:700;font-size:12px;color:#00d4ff;letter-spacing:.1em}
+      .mc7-badge{
+        font-size:8.5px;letter-spacing:.07em;padding:2px 8px;border-radius:20px;
+        border:1px solid rgba(0,200,255,.25);color:#00d4ff;cursor:pointer;transition:background .15s;
+      }
+      .mc7-badge:hover{background:rgba(0,200,255,.1)}
+      .mc7-badge.off{color:#334;border-color:#223}
+      .mc7-body{padding:10px 14px 12px}
+      .mc7-sec{
+        font-size:8.5px;letter-spacing:.1em;text-transform:uppercase;
+        color:rgba(0,180,255,.28);margin:10px 0 7px;
+      }
+      .mc7-sec:first-child{margin-top:0}
+      .mc7-row{display:flex;align-items:center;gap:5px;margin-bottom:6px}
+      .mc7-lbl{min-width:62px;color:#3d6478;font-size:10px}
+      .mc7-val{min-width:30px;text-align:right;color:#00d4ff;font-size:10px;font-weight:500}
+      .mc7-sl{flex:1;-webkit-appearance:none;height:2px;background:#121e28;border-radius:1px;outline:none;cursor:pointer}
+      .mc7-sl::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:#00d4ff;box-shadow:0 0 5px rgba(0,212,255,.55);cursor:pointer}
+      .mc7-sl::-moz-range-thumb{width:10px;height:10px;border-radius:50%;border:none;background:#00d4ff;box-shadow:0 0 5px rgba(0,212,255,.55);cursor:pointer}
+      .mc7-tog{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
+      .mc7-sw{position:relative;width:28px;height:15px;cursor:pointer;flex-shrink:0}
+      .mc7-sw input{opacity:0;width:0;height:0;position:absolute}
+      .mc7-trk{position:absolute;inset:0;background:#0d1e28;border-radius:8px;border:1px solid rgba(0,200,255,.15);transition:background .2s}
+      .mc7-knob{position:absolute;top:2px;left:2px;width:9px;height:9px;background:#2a4050;border-radius:50%;transition:transform .2s,background .2s}
+      .mc7-sw input:checked+.mc7-trk{background:rgba(0,180,255,.2);border-color:#00d4ff}
+      .mc7-sw input:checked+.mc7-trk .mc7-knob{transform:translateX(13px);background:#00d4ff}
+      .mc7-sep{height:1px;background:rgba(0,200,255,.07);margin:2px 0 8px}
+      .mc7-foot{text-align:center;font-size:9px;color:#1e3040;letter-spacing:.05em;padding:7px 0 8px;border-top:1px solid rgba(0,200,255,.06)}
+      .mc7-foot kbd{background:#080f18;border:1px solid #162030;border-radius:3px;padding:1px 4px;color:#2e5060;font-size:9px}
+    `;
+    document.head.appendChild(style);
+
+    const el = document.createElement('div');
+    el.id = 'mc7';
+    el.innerHTML = `
+      <div class="mc7-head">
+        <div class="mc7-title">✈ MSFS CAM</div>
+        <div class="mc7-badge on" id="mc7-en">ACTIVE</div>
+      </div>
+      <div class="mc7-body">
+
+        <div class="mc7-sec">Roll Lag</div>
+        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-rs" min="1" max="25" step="0.5" value="${CFG.roll.stiffness}"><span class="mc7-val" id="mc7-rs-v">${CFG.roll.stiffness}</span></div>
+        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-rd" min="1" max="15" step="0.2" value="${CFG.roll.damp}"><span class="mc7-val" id="mc7-rd-v">${CFG.roll.damp}</span></div>
+
+        <div class="mc7-sep"></div>
+        <div class="mc7-sec">Yaw / Heading</div>
+        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-hs" min="1" max="30" step="0.5" value="${CFG.heading.stiffness}"><span class="mc7-val" id="mc7-hs-v">${CFG.heading.stiffness}</span></div>
+        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-hd" min="1" max="18" step="0.2" value="${CFG.heading.damp}"><span class="mc7-val" id="mc7-hd-v">${CFG.heading.damp}</span></div>
+
+        <div class="mc7-sep"></div>
+        <div class="mc7-sec">Pitch</div>
+        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-ps" min="2" max="40" step="0.5" value="${CFG.pitch.stiffness}"><span class="mc7-val" id="mc7-ps-v">${CFG.pitch.stiffness}</span></div>
+        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-pd" min="1" max="20" step="0.2" value="${CFG.pitch.damp}"><span class="mc7-val" id="mc7-pd-v">${CFG.pitch.damp}</span></div>
+
+        <div class="mc7-sep"></div>
+        <div class="mc7-sec">Smooth Zoom ✨</div>
+        <div class="mc7-tog">
+          <span class="mc7-lbl" style="min-width:auto">Enable</span>
+          <label class="mc7-sw"><input type="checkbox" id="mc7-ze" checked><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        </div>
+        <div class="mc7-row">
+          <span class="mc7-lbl">Glide</span>
+          <input class="mc7-sl" type="range" id="mc7-zl" min="0.5" max="14" step="0.1" value="${CFG.zoom.lambda}">
+          <span class="mc7-val" id="mc7-zl-v">${CFG.zoom.lambda}</span>
+        </div>
+        <div class="mc7-row">
+          <span class="mc7-lbl">Step</span>
+          <input class="mc7-sl" type="range" id="mc7-zs" min="0.03" max="0.40" step="0.01" value="${CFG.zoom.stepFactor}">
+          <span class="mc7-val" id="mc7-zs-v">${CFG.zoom.stepFactor}</span>
+        </div>
+
+        <div class="mc7-sep"></div>
+        <div class="mc7-sec">Ground Rumble 🛞</div>
+        <div class="mc7-tog">
+          <span class="mc7-lbl" style="min-width:auto">Enable</span>
+          <label class="mc7-sw"><input type="checkbox" id="mc7-ge" ${CFG.groundShake.enabled?'checked':''}><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        </div>
+        <div class="mc7-row"><span class="mc7-lbl">Intensity</span><input class="mc7-sl" type="range" id="mc7-gm" min="0.001" max="0.018" step="0.001" value="${CFG.groundShake.maxMagnitude}"><span class="mc7-val" id="mc7-gm-v">${CFG.groundShake.maxMagnitude}</span></div>
+        <div class="mc7-row"><span class="mc7-lbl">Frequency</span><input class="mc7-sl" type="range" id="mc7-gf" min="4" max="30" step="1" value="${CFG.groundShake.frequency}"><span class="mc7-val" id="mc7-gf-v">${CFG.groundShake.frequency}</span></div>
+
+        <div class="mc7-sep"></div>
+        <div class="mc7-sec">Touchdown Thump 💥</div>
+        <div class="mc7-tog">
+          <span class="mc7-lbl" style="min-width:auto">Enable</span>
+          <label class="mc7-sw"><input type="checkbox" id="mc7-te" ${CFG.touchdown.enabled?'checked':''}><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        </div>
+        <div class="mc7-row"><span class="mc7-lbl">Peak Force</span><input class="mc7-sl" type="range" id="mc7-tm" min="0.004" max="0.045" step="0.001" value="${CFG.touchdown.peakMagnitude}"><span class="mc7-val" id="mc7-tm-v">${CFG.touchdown.peakMagnitude}</span></div>
+        <div class="mc7-row"><span class="mc7-lbl">Decay</span><input class="mc7-sl" type="range" id="mc7-td" min="2" max="20" step="0.5" value="${CFG.touchdown.decayRate}"><span class="mc7-val" id="mc7-td-v">${CFG.touchdown.decayRate}</span></div>
+
+      </div>
+      <div class="mc7-foot">
+        <kbd>Shift+C</kbd> hide &nbsp;·&nbsp; <kbd>Shift+R</kbd> reset
+      </div>
+    `;
+    document.body.appendChild(el);
+
+    document.getElementById('mc7-en').addEventListener('click', () => {
+      CFG.enabled = !CFG.enabled; initialized = false;
+      const b = document.getElementById('mc7-en');
+      b.textContent = CFG.enabled ? 'ACTIVE' : 'OFF';
+      b.className = 'mc7-badge ' + (CFG.enabled ? 'on' : 'off');
+    });
+
+    document.getElementById('mc7-ze').addEventListener('change', e => { CFG.zoom.enabled        = e.target.checked; zst.current = zst.target = -1; });
+    document.getElementById('mc7-ge').addEventListener('change', e => { CFG.groundShake.enabled = e.target.checked; });
+    document.getElementById('mc7-te').addEventListener('change', e => { CFG.touchdown.enabled   = e.target.checked; });
+
+    const sl = (id, vid, fn) => document.getElementById(id).addEventListener('input', e => {
+      const v = parseFloat(e.target.value); fn(v); document.getElementById(vid).textContent = v;
+    });
+    sl('mc7-rs','mc7-rs-v', v => CFG.roll.stiffness           = v);
+    sl('mc7-rd','mc7-rd-v', v => CFG.roll.damp                = v);
+    sl('mc7-hs','mc7-hs-v', v => CFG.heading.stiffness        = v);
+    sl('mc7-hd','mc7-hd-v', v => CFG.heading.damp             = v);
+    sl('mc7-ps','mc7-ps-v', v => CFG.pitch.stiffness          = v);
+    sl('mc7-pd','mc7-pd-v', v => CFG.pitch.damp               = v);
+    sl('mc7-zl','mc7-zl-v', v => CFG.zoom.lambda              = v);
+    sl('mc7-zs','mc7-zs-v', v => CFG.zoom.stepFactor          = v);
+    sl('mc7-gm','mc7-gm-v', v => CFG.groundShake.maxMagnitude = v);
+    sl('mc7-gf','mc7-gf-v', v => CFG.groundShake.frequency    = v);
+    sl('mc7-tm','mc7-tm-v', v => CFG.touchdown.peakMagnitude  = v);
+    sl('mc7-td','mc7-td-v', v => CFG.touchdown.decayRate      = v);
+
+    let vis = true;
+    document.addEventListener('keydown', e => {
+      if (!e.shiftKey) return;
+      if (e.key === 'C') { vis = !vis; el.classList.toggle('hidden', !vis); }
+      if (e.key === 'R') { initialized = false; shake.impactAmplitude = 0; zst.current = zst.target = -1; }
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  BOOT
+  // ══════════════════════════════════════════════════════════════════════════
+  function waitForGeoFS() {
+    if (window.geofs?.camera && typeof window.geofs.camera.update === 'function' && window.geofs.api?.viewer)
+      hookGeoFS();
+    else
+      setTimeout(waitForGeoFS, 500);
+  }
+
+  if (document.readyState === 'complete') setTimeout(waitForGeoFS, 3000);
+  else window.addEventListener('load', () => setTimeout(waitForGeoFS, 3000));
+
+})();
