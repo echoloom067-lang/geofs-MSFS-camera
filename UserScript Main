@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         GeoFS — MSFS 2020 Cinematic Camera
+// @name         GeoFS — MSFS Cinematic Camera
 // @namespace    https://greasyfork.org/
-// @version      7.0.0
-// @description  MSFS spring camera + ground rumble + touchdown thump + TRUE buttery smooth zoom
+// @version      8.0.0
+// @description  MSFS spring camera + ground rumble + touchdown thump · Modern draggable UI
 // @author       Echoloom
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
@@ -12,37 +12,12 @@
 (function () {
   'use strict';
 
-  // ══════════════════════════════════════════════════════════════════════════
-  //  HOW SMOOTH ZOOM WORKS HERE (why v6 failed):
-  //
-  //  GeoFS zoom = it moves the Cesium camera along its own direction vector
-  //  (dolly in/out). There is no single "distance" property to write to —
-  //  GeoFS recalculates the camera position from scratch every frame.
-  //
-  //  The fix:
-  //  1. Intercept wheel events with capture+preventDefault so GeoFS NEVER
-  //     sees them — its snap-zoom code never runs.
-  //  2. We accumulate a smooth TARGET distance ourselves.
-  //  3. Every frame, after our spring rotation override, we also override
-  //     the camera POSITION by computing: aircraftPos + (-direction * dist)
-  //     using the Cesium camera's current direction vector and our smoothed dist.
-  //  4. Exponential decay eases currentDist → targetDist every frame = silk.
-  // ══════════════════════════════════════════════════════════════════════════
-
   const CFG = {
     enabled: true,
 
     roll:    { stiffness: 6.0,  damp: 4.8 },
     heading: { stiffness: 9.0,  damp: 5.8 },
     pitch:   { stiffness: 14.0, damp: 7.5 },
-
-    zoom: {
-      enabled:    true,
-      lambda:     4.0,      // easing speed — 4 = MSFS feel (lower = floatier)
-      stepFactor: 0.13,     // how far each scroll tick moves target (fraction of current dist)
-      minDist:    10,       // metres
-      maxDist:    3000,
-    },
 
     groundShake: {
       enabled:      true,
@@ -74,12 +49,6 @@
     wasOnGround:     false,
   };
 
-  // Zoom state
-  const zst = {
-    current: -1,   // current smoothed distance (metres), -1 = uninitialised
-    target:  -1,
-  };
-
   let initialized = false;
   let lastT = performance.now();
 
@@ -93,12 +62,6 @@
     s.val += s.vel * dt;
   }
 
-  function expDecay(cur, tgt, lambda, dt) {
-    return tgt + (cur - tgt) * Math.exp(-lambda * dt);
-  }
-
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
   function rumbleNoise(t, seed) {
     return (
       Math.sin(t * 1.000 + seed)       * 0.40 +
@@ -108,47 +71,8 @@
     );
   }
 
-  // Measure how far the Cesium camera currently sits from the aircraft
-  function measureCurrentDist(cesiumCam) {
-    try {
-      const ac = window.geofs?.aircraft?.instance;
-      // GeoFS puts the aircraft world position in geofs.aircraft.instance.rigidBody?.position
-      // or on the object3d. Try both.
-      let ap = ac?.rigidBody?.position || ac?.object3d?.position;
-      if (!ap) return 80;
-      const cp = cesiumCam.positionWC;
-      const dx = cp.x - ap.x, dy = cp.y - ap.y, dz = cp.z - ap.z;
-      return Math.sqrt(dx*dx + dy*dy + dz*dz);
-    } catch (_) { return 80; }
-  }
-
   // ══════════════════════════════════════════════════════════════════════════
-  //  WHEEL INTERCEPT — block GeoFS, handle zoom ourselves
-  // ══════════════════════════════════════════════════════════════════════════
-  function hookScroll() {
-    window.addEventListener('wheel', function onWheel(e) {
-      if (!CFG.enabled || !CFG.zoom.enabled) return;
-
-      // Stop GeoFS from ever seeing this event
-      e.stopImmediatePropagation();
-      e.preventDefault();
-
-      // Init target if needed
-      if (zst.target < 0) {
-        const d = measureCurrentDist(window.geofs?.api?.viewer?.camera);
-        zst.current = d;
-        zst.target  = d;
-      }
-
-      const dir = e.deltaY > 0 ? 1 : -1;          // 1 = zoom out, -1 = zoom in
-      zst.target *= (1 + dir * CFG.zoom.stepFactor);
-      zst.target  = clamp(zst.target, CFG.zoom.minDist, CFG.zoom.maxDist);
-
-    }, { capture: true, passive: false });
-  }
-
-  // ══════════════════════════════════════════════════════════════════════════
-  //  MAIN HOOK — runs after geofs.camera.update() every frame
+  //  MAIN HOOK
   // ══════════════════════════════════════════════════════════════════════════
   function afterCameraUpdate() {
     if (!CFG.enabled) return;
@@ -158,21 +82,17 @@
       const cesiumCam = geofs.api.viewer.camera;
       if (!cesiumCam) return;
 
-      // After GeoFS update, Cesium cam = true aircraft angles + GeoFS-chosen distance
-      const trueH   = cesiumCam.heading;
-      const trueP   = cesiumCam.pitch;
-      const trueR   = cesiumCam.roll;
+      const trueH = cesiumCam.heading;
+      const trueP = cesiumCam.pitch;
+      const trueR = cesiumCam.roll;
 
       if (!isFinite(trueH) || !isFinite(trueP) || !isFinite(trueR)) return;
 
-      // ── Seed on first frame ──────────────────────────────────────────────
       if (!initialized) {
         spring.heading.val = trueH; spring.heading.vel = 0;
         spring.pitch.val   = trueP; spring.pitch.vel   = 0;
         spring.roll.val    = trueR; spring.roll.vel    = 0;
         shake.wasOnGround  = false;
-        zst.current        = measureCurrentDist(cesiumCam);
-        zst.target         = zst.current;
         initialized        = true;
         return;
       }
@@ -182,18 +102,10 @@
       lastT = now;
       const t = now / 1000;
 
-      // ── Spring rotation ──────────────────────────────────────────────────
       springStep(spring.heading, trueH, CFG.heading, dt);
       springStep(spring.pitch,   trueP, CFG.pitch,   dt);
       springStep(spring.roll,    trueR, CFG.roll,    dt);
 
-      // ── Smooth zoom ──────────────────────────────────────────────────────
-      // Ease current distance toward target
-      if (CFG.zoom.enabled && zst.target > 0) {
-        zst.current = expDecay(zst.current, zst.target, CFG.zoom.lambda, dt);
-      }
-
-      // ── Aircraft / shake data ────────────────────────────────────────────
       const vals     = geofs.animation.values;
       const onGround = !!(vals.groundContact || vals.onGround || (vals.altitude != null && vals.altitude < 5));
       const speedKts = Math.abs(vals.kias || vals.speed || 0);
@@ -207,24 +119,25 @@
           shake.impactAmplitude = td.peakMagnitude * hardness;
           shake.impactLastTime  = t;
           shake.impactStartTime = t;
-          console.log(`%c[MSFS Cam] Touchdown! ${Math.round(vsFpm)} fpm · ${hardness.toFixed(2)}x`,
-            hardness > 1 ? 'color:#ff6644' : 'color:#44cc88');
         }
         shake.wasOnGround = onGround;
       }
+
       if (shake.impactAmplitude > 0.00001)
         shake.impactAmplitude *= Math.exp(-CFG.touchdown.decayRate * dt);
       else shake.impactAmplitude = 0;
 
       let shakeP = 0, shakeR = 0;
+
       if (CFG.groundShake.enabled && onGround && speedKts > 2) {
-        const gs = CFG.groundShake;
+        const gs  = CFG.groundShake;
         const spd = Math.min(speedKts / gs.fullSpeedKts, 1);
         const mag = gs.maxMagnitude * spd * Math.min(speedKts / 10, 1);
         const frq = gs.frequency * (spd * 0.7 + 0.3);
         shakeP += rumbleNoise(t * frq, 0) * mag;
         shakeR += rumbleNoise(t * frq * 0.85, 7.3) * mag * 0.7;
       }
+
       if (shake.impactAmplitude > 0) {
         const ph = (t - shake.impactStartTime) * 18;
         shakeP += Math.sin(ph)       * shake.impactAmplitude;
@@ -233,54 +146,12 @@
           spring.heading.val += Math.sin(ph * 0.4) * shake.impactAmplitude * 0.3 * dt * 6;
       }
 
-      // ── Build final camera orientation ───────────────────────────────────
-      const finalH = spring.heading.val;
-      const finalP = spring.pitch.val + shakeP;
-      const finalR = spring.roll.val  + shakeR;
-
-      // ── Compute smooth-zoom camera position ──────────────────────────────
-      // GeoFS already placed the camera at some position. We need the aircraft
-      // world-space position, then push the camera back along its look direction
-      // by our smoothed distance.
-      //
-      // Cesium direction vector points FROM camera TOWARD target.
-      // So: cameraPos = aircraftPos - direction * dist
-      //
-      // We use the CURRENT (post-spring) direction rather than Cesium's stored
-      // direction so position and orientation stay in sync.
-
-      let finalPos = cesiumCam.positionWC; // fallback = keep GeoFS position
-
-      if (CFG.zoom.enabled && zst.current > 0) {
-        try {
-          const ac  = geofs.aircraft.instance;
-          const ap  = ac?.rigidBody?.position || ac?.object3d?.position;
-          if (ap) {
-            // Compute look direction from our spring-smoothed HPR
-            // In Cesium, heading=0 points North, pitch=0 is horizontal.
-            // direction = (cos(pitch)*sin(heading), cos(pitch)*cos(heading), -sin(pitch))
-            // but in ECEF we need to rotate by the surface normal at the aircraft's position.
-            // Simplest correct approach: use cesiumCam.directionWC (set by setView below after
-            // we call it), but we need the position BEFORE setView.
-            // So: use the direction that Cesium has right now (from GeoFS's setView this frame).
-            const d  = cesiumCam.directionWC;
-            const dist = zst.current;
-            finalPos = {
-              x: ap.x - d.x * dist,
-              y: ap.y - d.y * dist,
-              z: ap.z - d.z * dist,
-            };
-          }
-        } catch (_) {}
-      }
-
-      // ── Write to Cesium — position + orientation together ────────────────
       cesiumCam.setView({
-        destination: finalPos,
+        destination: cesiumCam.positionWC,
         orientation: {
-          heading: finalH,
-          pitch:   finalP,
-          roll:    finalR,
+          heading: spring.heading.val,
+          pitch:   spring.pitch.val + shakeP,
+          roll:    spring.roll.val  + shakeR,
         },
       });
 
@@ -301,161 +172,529 @@
       afterCameraUpdate();
       return r;
     };
-    hookScroll();
-    console.log('%c[MSFS Cam v7] ✨ Loaded — spring · rumble · touchdown · butter zoom', 'color:#00d4ff;font-weight:bold;font-size:12px');
+    console.log('%c[MSFS Cam v8] Loaded', 'color:#e8c97a;font-weight:bold');
     createUI();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  UI
+  //  UI — Draggable, modern, no glow
   // ══════════════════════════════════════════════════════════════════════════
   function createUI() {
     const style = document.createElement('style');
     style.textContent = `
-      #mc7{
-        position:fixed;bottom:18px;right:18px;z-index:99999;width:252px;
-        background:rgba(3,7,14,0.93);
-        border:1px solid rgba(0,200,255,0.18);border-radius:13px;
-        font:11px/1.5 'Courier New',monospace;color:#80aabe;
-        box-shadow:0 10px 50px rgba(0,0,0,0.65),inset 0 1px 0 rgba(255,255,255,0.03);
-        backdrop-filter:blur(16px);user-select:none;
-        transition:opacity .22s,transform .22s;overflow:hidden;
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+      #mc8 {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 99999;
+        width: 260px;
+        background: #101418;
+        border: 1px solid #2a2e35;
+        border-radius: 12px;
+        font-family: 'DM Sans', sans-serif;
+        font-size: 12px;
+        color: #8a9099;
+        overflow: hidden;
+        transition: opacity 0.18s ease, transform 0.18s ease;
       }
-      #mc7.hidden{opacity:0;pointer-events:none;transform:translateY(8px)}
-      .mc7-head{
-        display:flex;justify-content:space-between;align-items:center;
-        padding:10px 14px 9px;background:rgba(0,180,255,0.05);
-        border-bottom:1px solid rgba(0,200,255,0.09);
+
+      #mc8.mc8-collapsed .mc8-body,
+      #mc8.mc8-collapsed .mc8-footer {
+        display: none;
       }
-      .mc7-title{font-weight:700;font-size:12px;color:#00d4ff;letter-spacing:.1em}
-      .mc7-badge{
-        font-size:8.5px;letter-spacing:.07em;padding:2px 8px;border-radius:20px;
-        border:1px solid rgba(0,200,255,.25);color:#00d4ff;cursor:pointer;transition:background .15s;
+
+      #mc8.mc8-hidden {
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(6px);
       }
-      .mc7-badge:hover{background:rgba(0,200,255,.1)}
-      .mc7-badge.off{color:#334;border-color:#223}
-      .mc7-body{padding:10px 14px 12px}
-      .mc7-sec{
-        font-size:8.5px;letter-spacing:.1em;text-transform:uppercase;
-        color:rgba(0,180,255,.28);margin:10px 0 7px;
+
+      /* Header */
+      .mc8-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 11px 12px;
+        background: #0d1014;
+        border-bottom: 1px solid #1e2228;
+        cursor: grab;
+        user-select: none;
       }
-      .mc7-sec:first-child{margin-top:0}
-      .mc7-row{display:flex;align-items:center;gap:5px;margin-bottom:6px}
-      .mc7-lbl{min-width:62px;color:#3d6478;font-size:10px}
-      .mc7-val{min-width:30px;text-align:right;color:#00d4ff;font-size:10px;font-weight:500}
-      .mc7-sl{flex:1;-webkit-appearance:none;height:2px;background:#121e28;border-radius:1px;outline:none;cursor:pointer}
-      .mc7-sl::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:#00d4ff;box-shadow:0 0 5px rgba(0,212,255,.55);cursor:pointer}
-      .mc7-sl::-moz-range-thumb{width:10px;height:10px;border-radius:50%;border:none;background:#00d4ff;box-shadow:0 0 5px rgba(0,212,255,.55);cursor:pointer}
-      .mc7-tog{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}
-      .mc7-sw{position:relative;width:28px;height:15px;cursor:pointer;flex-shrink:0}
-      .mc7-sw input{opacity:0;width:0;height:0;position:absolute}
-      .mc7-trk{position:absolute;inset:0;background:#0d1e28;border-radius:8px;border:1px solid rgba(0,200,255,.15);transition:background .2s}
-      .mc7-knob{position:absolute;top:2px;left:2px;width:9px;height:9px;background:#2a4050;border-radius:50%;transition:transform .2s,background .2s}
-      .mc7-sw input:checked+.mc7-trk{background:rgba(0,180,255,.2);border-color:#00d4ff}
-      .mc7-sw input:checked+.mc7-trk .mc7-knob{transform:translateX(13px);background:#00d4ff}
-      .mc7-sep{height:1px;background:rgba(0,200,255,.07);margin:2px 0 8px}
-      .mc7-foot{text-align:center;font-size:9px;color:#1e3040;letter-spacing:.05em;padding:7px 0 8px;border-top:1px solid rgba(0,200,255,.06)}
-      .mc7-foot kbd{background:#080f18;border:1px solid #162030;border-radius:3px;padding:1px 4px;color:#2e5060;font-size:9px}
+      .mc8-header:active { cursor: grabbing; }
+
+      .mc8-icon {
+        width: 22px;
+        height: 22px;
+        background: #1e2228;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        flex-shrink: 0;
+      }
+
+      .mc8-title {
+        flex: 1;
+        font-weight: 600;
+        font-size: 11.5px;
+        color: #dde1e7;
+        letter-spacing: 0.03em;
+      }
+
+      .mc8-pill {
+        font-family: 'DM Mono', monospace;
+        font-size: 9px;
+        font-weight: 500;
+        padding: 2px 7px;
+        border-radius: 20px;
+        border: 1px solid #2a2e35;
+        color: #5a8a5a;
+        background: #101810;
+        cursor: pointer;
+        transition: all 0.15s;
+        letter-spacing: 0.05em;
+      }
+      .mc8-pill.off {
+        color: #5a5a5a;
+        background: #141414;
+        border-color: #242424;
+      }
+      .mc8-pill:hover { border-color: #3a3e45; }
+
+      .mc8-btn-collapse,
+      .mc8-btn-hide {
+        width: 20px;
+        height: 20px;
+        background: none;
+        border: 1px solid #2a2e35;
+        border-radius: 5px;
+        color: #4a5060;
+        font-size: 10px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+        flex-shrink: 0;
+        line-height: 1;
+      }
+      .mc8-btn-collapse:hover,
+      .mc8-btn-hide:hover {
+        background: #1e2228;
+        color: #8a9099;
+        border-color: #3a3e45;
+      }
+
+      /* Body */
+      .mc8-body {
+        padding: 10px 12px 4px;
+        max-height: 480px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: #2a2e35 transparent;
+      }
+      .mc8-body::-webkit-scrollbar { width: 4px; }
+      .mc8-body::-webkit-scrollbar-track { background: transparent; }
+      .mc8-body::-webkit-scrollbar-thumb { background: #2a2e35; border-radius: 2px; }
+
+      /* Section label */
+      .mc8-sec {
+        font-family: 'DM Mono', monospace;
+        font-size: 9px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: #3a4050;
+        margin: 10px 0 7px;
+      }
+      .mc8-sec:first-child { margin-top: 2px; }
+
+      .mc8-divider {
+        height: 1px;
+        background: #1a1e24;
+        margin: 8px 0;
+      }
+
+      /* Toggle row */
+      .mc8-toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+      .mc8-toggle-lbl {
+        font-size: 11px;
+        color: #6a7080;
+      }
+
+      /* Switch */
+      .mc8-switch {
+        position: relative;
+        width: 30px;
+        height: 16px;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .mc8-switch input { display: none; }
+      .mc8-track {
+        position: absolute;
+        inset: 0;
+        background: #1a1e24;
+        border: 1px solid #2a2e35;
+        border-radius: 8px;
+        transition: background 0.2s, border-color 0.2s;
+      }
+      .mc8-knob {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 10px;
+        height: 10px;
+        background: #3a4050;
+        border-radius: 50%;
+        transition: transform 0.2s, background 0.2s;
+      }
+      .mc8-switch input:checked + .mc8-track {
+        background: #1a2a1a;
+        border-color: #3a6a3a;
+      }
+      .mc8-switch input:checked + .mc8-track .mc8-knob {
+        transform: translateX(14px);
+        background: #5a9a5a;
+      }
+
+      /* Slider rows */
+      .mc8-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 7px;
+      }
+      .mc8-lbl {
+        min-width: 58px;
+        font-size: 10.5px;
+        color: #5a6070;
+      }
+      .mc8-val {
+        min-width: 28px;
+        text-align: right;
+        font-family: 'DM Mono', monospace;
+        font-size: 10px;
+        color: #8a9099;
+      }
+      .mc8-sl {
+        flex: 1;
+        -webkit-appearance: none;
+        height: 2px;
+        background: #1e2228;
+        border-radius: 1px;
+        outline: none;
+        cursor: pointer;
+        border: none;
+      }
+      .mc8-sl::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #dde1e7;
+        cursor: pointer;
+        transition: background 0.15s, transform 0.15s;
+      }
+      .mc8-sl:hover::-webkit-slider-thumb {
+        background: #fff;
+        transform: scale(1.15);
+      }
+      .mc8-sl::-moz-range-thumb {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        border: none;
+        background: #dde1e7;
+        cursor: pointer;
+      }
+
+      /* Footer */
+      .mc8-footer {
+        padding: 7px 12px 8px;
+        border-top: 1px solid #1a1e24;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .mc8-hint {
+        font-family: 'DM Mono', monospace;
+        font-size: 9px;
+        color: #2a3040;
+        letter-spacing: 0.04em;
+      }
+      .mc8-hint kbd {
+        background: #141618;
+        border: 1px solid #222630;
+        border-radius: 3px;
+        padding: 1px 4px;
+        color: #3a4050;
+        font-size: 9px;
+      }
+      .mc8-reset {
+        font-family: 'DM Mono', monospace;
+        font-size: 9px;
+        color: #3a4050;
+        background: none;
+        border: 1px solid #1e2228;
+        border-radius: 4px;
+        padding: 2px 7px;
+        cursor: pointer;
+        transition: all 0.15s;
+        letter-spacing: 0.04em;
+      }
+      .mc8-reset:hover { color: #6a7080; border-color: #2a2e35; }
+
+      /* Floating show button */
+      #mc8-show-btn {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 99998;
+        width: 36px;
+        height: 36px;
+        background: #101418;
+        border: 1px solid #2a2e35;
+        border-radius: 10px;
+        color: #6a7080;
+        font-size: 14px;
+        cursor: pointer;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s;
+        font-family: sans-serif;
+      }
+      #mc8-show-btn:hover {
+        background: #1a1e24;
+        color: #dde1e7;
+        border-color: #3a3e45;
+      }
+      #mc8-show-btn.visible {
+        display: flex;
+      }
     `;
     document.head.appendChild(style);
 
-    const el = document.createElement('div');
-    el.id = 'mc7';
-    el.innerHTML = `
-      <div class="mc7-head">
-        <div class="mc7-title">✈ MSFS CAM</div>
-        <div class="mc7-badge on" id="mc7-en">ACTIVE</div>
+    // ── Build panel ────────────────────────────────────────────────────────
+    const panel = document.createElement('div');
+    panel.id = 'mc8';
+    panel.innerHTML = `
+      <div class="mc8-header" id="mc8-drag-handle">
+        <div class="mc8-icon">✈</div>
+        <div class="mc8-title">MSFS Cam</div>
+        <div class="mc8-pill" id="mc8-en">ON</div>
+        <button class="mc8-btn-collapse" id="mc8-collapse" title="Collapse">–</button>
+        <button class="mc8-btn-hide" id="mc8-hide" title="Hide panel">✕</button>
       </div>
-      <div class="mc7-body">
 
-        <div class="mc7-sec">Roll Lag</div>
-        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-rs" min="1" max="25" step="0.5" value="${CFG.roll.stiffness}"><span class="mc7-val" id="mc7-rs-v">${CFG.roll.stiffness}</span></div>
-        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-rd" min="1" max="15" step="0.2" value="${CFG.roll.damp}"><span class="mc7-val" id="mc7-rd-v">${CFG.roll.damp}</span></div>
+      <div class="mc8-body">
 
-        <div class="mc7-sep"></div>
-        <div class="mc7-sec">Yaw / Heading</div>
-        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-hs" min="1" max="30" step="0.5" value="${CFG.heading.stiffness}"><span class="mc7-val" id="mc7-hs-v">${CFG.heading.stiffness}</span></div>
-        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-hd" min="1" max="18" step="0.2" value="${CFG.heading.damp}"><span class="mc7-val" id="mc7-hd-v">${CFG.heading.damp}</span></div>
-
-        <div class="mc7-sep"></div>
-        <div class="mc7-sec">Pitch</div>
-        <div class="mc7-row"><span class="mc7-lbl">Pull</span><input class="mc7-sl" type="range" id="mc7-ps" min="2" max="40" step="0.5" value="${CFG.pitch.stiffness}"><span class="mc7-val" id="mc7-ps-v">${CFG.pitch.stiffness}</span></div>
-        <div class="mc7-row"><span class="mc7-lbl">Damp</span><input class="mc7-sl" type="range" id="mc7-pd" min="1" max="20" step="0.2" value="${CFG.pitch.damp}"><span class="mc7-val" id="mc7-pd-v">${CFG.pitch.damp}</span></div>
-
-        <div class="mc7-sep"></div>
-        <div class="mc7-sec">Smooth Zoom ✨</div>
-        <div class="mc7-tog">
-          <span class="mc7-lbl" style="min-width:auto">Enable</span>
-          <label class="mc7-sw"><input type="checkbox" id="mc7-ze" checked><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        <div class="mc8-sec">Roll</div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Pull</span>
+          <input class="mc8-sl" type="range" id="mc8-rs" min="1" max="25" step="0.5" value="${CFG.roll.stiffness}">
+          <span class="mc8-val" id="mc8-rs-v">${CFG.roll.stiffness}</span>
         </div>
-        <div class="mc7-row">
-          <span class="mc7-lbl">Glide</span>
-          <input class="mc7-sl" type="range" id="mc7-zl" min="0.5" max="14" step="0.1" value="${CFG.zoom.lambda}">
-          <span class="mc7-val" id="mc7-zl-v">${CFG.zoom.lambda}</span>
-        </div>
-        <div class="mc7-row">
-          <span class="mc7-lbl">Step</span>
-          <input class="mc7-sl" type="range" id="mc7-zs" min="0.03" max="0.40" step="0.01" value="${CFG.zoom.stepFactor}">
-          <span class="mc7-val" id="mc7-zs-v">${CFG.zoom.stepFactor}</span>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Damp</span>
+          <input class="mc8-sl" type="range" id="mc8-rd" min="1" max="15" step="0.2" value="${CFG.roll.damp}">
+          <span class="mc8-val" id="mc8-rd-v">${CFG.roll.damp}</span>
         </div>
 
-        <div class="mc7-sep"></div>
-        <div class="mc7-sec">Ground Rumble 🛞</div>
-        <div class="mc7-tog">
-          <span class="mc7-lbl" style="min-width:auto">Enable</span>
-          <label class="mc7-sw"><input type="checkbox" id="mc7-ge" ${CFG.groundShake.enabled?'checked':''}><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        <div class="mc8-divider"></div>
+        <div class="mc8-sec">Heading / Yaw</div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Pull</span>
+          <input class="mc8-sl" type="range" id="mc8-hs" min="1" max="30" step="0.5" value="${CFG.heading.stiffness}">
+          <span class="mc8-val" id="mc8-hs-v">${CFG.heading.stiffness}</span>
         </div>
-        <div class="mc7-row"><span class="mc7-lbl">Intensity</span><input class="mc7-sl" type="range" id="mc7-gm" min="0.001" max="0.018" step="0.001" value="${CFG.groundShake.maxMagnitude}"><span class="mc7-val" id="mc7-gm-v">${CFG.groundShake.maxMagnitude}</span></div>
-        <div class="mc7-row"><span class="mc7-lbl">Frequency</span><input class="mc7-sl" type="range" id="mc7-gf" min="4" max="30" step="1" value="${CFG.groundShake.frequency}"><span class="mc7-val" id="mc7-gf-v">${CFG.groundShake.frequency}</span></div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Damp</span>
+          <input class="mc8-sl" type="range" id="mc8-hd" min="1" max="18" step="0.2" value="${CFG.heading.damp}">
+          <span class="mc8-val" id="mc8-hd-v">${CFG.heading.damp}</span>
+        </div>
 
-        <div class="mc7-sep"></div>
-        <div class="mc7-sec">Touchdown Thump 💥</div>
-        <div class="mc7-tog">
-          <span class="mc7-lbl" style="min-width:auto">Enable</span>
-          <label class="mc7-sw"><input type="checkbox" id="mc7-te" ${CFG.touchdown.enabled?'checked':''}><div class="mc7-trk"><div class="mc7-knob"></div></div></label>
+        <div class="mc8-divider"></div>
+        <div class="mc8-sec">Pitch</div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Pull</span>
+          <input class="mc8-sl" type="range" id="mc8-ps" min="2" max="40" step="0.5" value="${CFG.pitch.stiffness}">
+          <span class="mc8-val" id="mc8-ps-v">${CFG.pitch.stiffness}</span>
         </div>
-        <div class="mc7-row"><span class="mc7-lbl">Peak Force</span><input class="mc7-sl" type="range" id="mc7-tm" min="0.004" max="0.045" step="0.001" value="${CFG.touchdown.peakMagnitude}"><span class="mc7-val" id="mc7-tm-v">${CFG.touchdown.peakMagnitude}</span></div>
-        <div class="mc7-row"><span class="mc7-lbl">Decay</span><input class="mc7-sl" type="range" id="mc7-td" min="2" max="20" step="0.5" value="${CFG.touchdown.decayRate}"><span class="mc7-val" id="mc7-td-v">${CFG.touchdown.decayRate}</span></div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Damp</span>
+          <input class="mc8-sl" type="range" id="mc8-pd" min="1" max="20" step="0.2" value="${CFG.pitch.damp}">
+          <span class="mc8-val" id="mc8-pd-v">${CFG.pitch.damp}</span>
+        </div>
+
+        <div class="mc8-divider"></div>
+        <div class="mc8-sec">Ground Rumble</div>
+        <div class="mc8-toggle-row">
+          <span class="mc8-toggle-lbl">Enable</span>
+          <label class="mc8-switch">
+            <input type="checkbox" id="mc8-ge" ${CFG.groundShake.enabled ? 'checked' : ''}>
+            <div class="mc8-track"><div class="mc8-knob"></div></div>
+          </label>
+        </div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Intensity</span>
+          <input class="mc8-sl" type="range" id="mc8-gm" min="0.001" max="0.018" step="0.001" value="${CFG.groundShake.maxMagnitude}">
+          <span class="mc8-val" id="mc8-gm-v">${CFG.groundShake.maxMagnitude}</span>
+        </div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Frequency</span>
+          <input class="mc8-sl" type="range" id="mc8-gf" min="4" max="30" step="1" value="${CFG.groundShake.frequency}">
+          <span class="mc8-val" id="mc8-gf-v">${CFG.groundShake.frequency}</span>
+        </div>
+
+        <div class="mc8-divider"></div>
+        <div class="mc8-sec">Touchdown</div>
+        <div class="mc8-toggle-row">
+          <span class="mc8-toggle-lbl">Enable</span>
+          <label class="mc8-switch">
+            <input type="checkbox" id="mc8-te" ${CFG.touchdown.enabled ? 'checked' : ''}>
+            <div class="mc8-track"><div class="mc8-knob"></div></div>
+          </label>
+        </div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Peak Force</span>
+          <input class="mc8-sl" type="range" id="mc8-tm" min="0.004" max="0.045" step="0.001" value="${CFG.touchdown.peakMagnitude}">
+          <span class="mc8-val" id="mc8-tm-v">${CFG.touchdown.peakMagnitude}</span>
+        </div>
+        <div class="mc8-row">
+          <span class="mc8-lbl">Decay</span>
+          <input class="mc8-sl" type="range" id="mc8-td" min="2" max="20" step="0.5" value="${CFG.touchdown.decayRate}">
+          <span class="mc8-val" id="mc8-td-v">${CFG.touchdown.decayRate}</span>
+        </div>
 
       </div>
-      <div class="mc7-foot">
-        <kbd>Shift+C</kbd> hide &nbsp;·&nbsp; <kbd>Shift+R</kbd> reset
+
+      <div class="mc8-footer">
+        <div class="mc8-hint"><kbd>Shift+9</kbd> hide &nbsp;<kbd>Shift+0</kbd> reset</div>
+        <button class="mc8-reset" id="mc8-reset">Reset</button>
       </div>
     `;
-    document.body.appendChild(el);
+    document.body.appendChild(panel);
 
-    document.getElementById('mc7-en').addEventListener('click', () => {
-      CFG.enabled = !CFG.enabled; initialized = false;
-      const b = document.getElementById('mc7-en');
-      b.textContent = CFG.enabled ? 'ACTIVE' : 'OFF';
-      b.className = 'mc7-badge ' + (CFG.enabled ? 'on' : 'off');
+    // ── Show button (appears when panel hidden) ────────────────────────────
+    const showBtn = document.createElement('button');
+    showBtn.id = 'mc8-show-btn';
+    showBtn.title = 'Show MSFS Cam';
+    showBtn.textContent = '✈';
+    document.body.appendChild(showBtn);
+
+    // ── Wire controls ──────────────────────────────────────────────────────
+    document.getElementById('mc8-en').addEventListener('click', () => {
+      CFG.enabled = !CFG.enabled;
+      initialized = false;
+      const b = document.getElementById('mc8-en');
+      b.textContent = CFG.enabled ? 'ON' : 'OFF';
+      b.style.color = CFG.enabled ? '' : '#5a5a5a';
+      b.style.borderColor = CFG.enabled ? '' : '#242424';
     });
 
-    document.getElementById('mc7-ze').addEventListener('change', e => { CFG.zoom.enabled        = e.target.checked; zst.current = zst.target = -1; });
-    document.getElementById('mc7-ge').addEventListener('change', e => { CFG.groundShake.enabled = e.target.checked; });
-    document.getElementById('mc7-te').addEventListener('change', e => { CFG.touchdown.enabled   = e.target.checked; });
+    document.getElementById('mc8-ge').addEventListener('change', e => { CFG.groundShake.enabled = e.target.checked; });
+    document.getElementById('mc8-te').addEventListener('change', e => { CFG.touchdown.enabled   = e.target.checked; });
 
     const sl = (id, vid, fn) => document.getElementById(id).addEventListener('input', e => {
-      const v = parseFloat(e.target.value); fn(v); document.getElementById(vid).textContent = v;
+      const v = parseFloat(e.target.value); fn(v);
+      document.getElementById(vid).textContent = v;
     });
-    sl('mc7-rs','mc7-rs-v', v => CFG.roll.stiffness           = v);
-    sl('mc7-rd','mc7-rd-v', v => CFG.roll.damp                = v);
-    sl('mc7-hs','mc7-hs-v', v => CFG.heading.stiffness        = v);
-    sl('mc7-hd','mc7-hd-v', v => CFG.heading.damp             = v);
-    sl('mc7-ps','mc7-ps-v', v => CFG.pitch.stiffness          = v);
-    sl('mc7-pd','mc7-pd-v', v => CFG.pitch.damp               = v);
-    sl('mc7-zl','mc7-zl-v', v => CFG.zoom.lambda              = v);
-    sl('mc7-zs','mc7-zs-v', v => CFG.zoom.stepFactor          = v);
-    sl('mc7-gm','mc7-gm-v', v => CFG.groundShake.maxMagnitude = v);
-    sl('mc7-gf','mc7-gf-v', v => CFG.groundShake.frequency    = v);
-    sl('mc7-tm','mc7-tm-v', v => CFG.touchdown.peakMagnitude  = v);
-    sl('mc7-td','mc7-td-v', v => CFG.touchdown.decayRate      = v);
+    sl('mc8-rs', 'mc8-rs-v', v => CFG.roll.stiffness           = v);
+    sl('mc8-rd', 'mc8-rd-v', v => CFG.roll.damp                = v);
+    sl('mc8-hs', 'mc8-hs-v', v => CFG.heading.stiffness        = v);
+    sl('mc8-hd', 'mc8-hd-v', v => CFG.heading.damp             = v);
+    sl('mc8-ps', 'mc8-ps-v', v => CFG.pitch.stiffness          = v);
+    sl('mc8-pd', 'mc8-pd-v', v => CFG.pitch.damp               = v);
+    sl('mc8-gm', 'mc8-gm-v', v => CFG.groundShake.maxMagnitude = v);
+    sl('mc8-gf', 'mc8-gf-v', v => CFG.groundShake.frequency    = v);
+    sl('mc8-tm', 'mc8-tm-v', v => CFG.touchdown.peakMagnitude  = v);
+    sl('mc8-td', 'mc8-td-v', v => CFG.touchdown.decayRate      = v);
 
-    let vis = true;
+    // Collapse toggle
+    let collapsed = false;
+    document.getElementById('mc8-collapse').addEventListener('click', () => {
+      collapsed = !collapsed;
+      panel.classList.toggle('mc8-collapsed', collapsed);
+      document.getElementById('mc8-collapse').textContent = collapsed ? '+' : '–';
+    });
+
+    // Hide / Show
+    let panelVisible = true;
+    function hidePanel() {
+      panelVisible = false;
+      panel.classList.add('mc8-hidden');
+      showBtn.classList.add('visible');
+      // Match show button to panel position
+      const r = panel.getBoundingClientRect();
+      showBtn.style.right  = (window.innerWidth - r.right)  + 'px';
+      showBtn.style.bottom = (window.innerHeight - r.bottom) + 'px';
+      showBtn.style.left   = 'unset';
+      showBtn.style.top    = 'unset';
+    }
+    function showPanel() {
+      panelVisible = true;
+      panel.classList.remove('mc8-hidden');
+      showBtn.classList.remove('visible');
+    }
+
+    document.getElementById('mc8-hide').addEventListener('click', hidePanel);
+    showBtn.addEventListener('click', showPanel);
+
+    // Reset
+    document.getElementById('mc8-reset').addEventListener('click', () => {
+      initialized = false;
+      shake.impactAmplitude = 0;
+    });
+
+    // Keyboard shortcuts
     document.addEventListener('keydown', e => {
       if (!e.shiftKey) return;
-      if (e.key === 'C') { vis = !vis; el.classList.toggle('hidden', !vis); }
-      if (e.key === 'R') { initialized = false; shake.impactAmplitude = 0; zst.current = zst.target = -1; }
+      if (e.key === '9') panelVisible ? hidePanel() : showPanel();
+      if (e.key === '0') { initialized = false; shake.impactAmplitude = 0; }
+    });
+
+    // ── Drag ──────────────────────────────────────────────────────────────
+    const handle = document.getElementById('mc8-drag-handle');
+    let dragging = false, ox = 0, oy = 0;
+
+    handle.addEventListener('mousedown', e => {
+      // Don't drag if clicking a button inside the header
+      if (e.target.tagName === 'BUTTON' || e.target.classList.contains('mc8-pill')) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      ox = e.clientX - rect.left;
+      oy = e.clientY - rect.top;
+      panel.style.transition = 'none';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', e => {
+      if (!dragging) return;
+      let nx = e.clientX - ox;
+      let ny = e.clientY - oy;
+      // Clamp to viewport
+      nx = Math.max(0, Math.min(window.innerWidth  - panel.offsetWidth,  nx));
+      ny = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, ny));
+      panel.style.left   = nx + 'px';
+      panel.style.top    = ny + 'px';
+      panel.style.right  = 'unset';
+      panel.style.bottom = 'unset';
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (dragging) {
+        dragging = false;
+        panel.style.transition = '';
+      }
     });
   }
 
